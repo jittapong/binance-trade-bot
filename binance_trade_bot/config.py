@@ -1,5 +1,6 @@
 import configparser
 import os
+import json
 
 import binance.client
 
@@ -160,3 +161,11 @@ class Config:  # pylint: disable=too-few-public-methods,too-many-instance-attrib
         use_margin = os.environ.get("USE_MARGIN") or config.get(USER_CFG_SECTION, "use_margin")
         self.USE_MARGIN = str(use_margin).lower() == 'true'
         self.SCOUT_MARGIN = float(os.environ.get("SCOUT_MARGIN") or config.get(USER_CFG_SECTION, "scout_margin"))
+        
+        backtest_interval = os.environ.get("BACKTEST_INTERVAL") or config.get(USER_CFG_SECTION, "backtest_interval")
+        self.BACKTEST_INTERVAL = int(backtest_interval)
+
+        backtest_yield_interval = os.environ.get("BACKTEST_YIELD_INTERVAL") or config.get(USER_CFG_SECTION, "backtest_yield_interval")
+        self.BACKTEST_YIELD_INTERVAL = int(backtest_yield_interval)
+        
+        self.STRATEGY_CONFIG = json.loads(config.get(USER_CFG_SECTION, "strategy_config"))

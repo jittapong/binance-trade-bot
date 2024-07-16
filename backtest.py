@@ -4,8 +4,8 @@ from binance_trade_bot import backtest
 
 if __name__ == "__main__":
     history = []
-    start_time = datetime(2021, 6, 1, 0, 0)
-    end_time = datetime(2021, 7, 1, 23, 59)
+    start_time = datetime(2022, 1, 1, 0, 0)
+    end_time = datetime(2024, 7, 16, 23, 59)
     print(f"BACKTEST from {start_time} to {end_time}")
     current_date = start_time.strftime("%d/%m/%Y")
     for manager in backtest(start_time, end_time):
@@ -19,16 +19,16 @@ if __name__ == "__main__":
         bridge_diff = round((bridge_value - history[0][1]) / history[0][1] * 100, 3)
         if manager.datetime.strftime("%d/%m/%Y") != current_date:
             current_date = manager.datetime.strftime("%d/%m/%Y")
-            print("------")
-            print("TIME:", manager.datetime)
-            print("TRADES:", trades)
-            #print("PAID FEES:", manager.paid_fees)
-            #print("BTC FEES VALUE:", btc_fees_value)
-            print(f"{manager.config.BRIDGE.symbol} FEES VALUE:", bridge_fees_value)
-            #print("BALANCES:", manager.balances)
-            print("BTC VALUE:", btc_value, f"({btc_diff}%)")
-            print(f"{manager.config.BRIDGE.symbol} VALUE:", bridge_value, f"({bridge_diff}%)")
-            print("------")
+            # print("------")
+            # print("TIME:", manager.datetime)
+            # print("TRADES:", trades)
+            # #print("PAID FEES:", manager.paid_fees)
+            # #print("BTC FEES VALUE:", btc_fees_value)
+            # print(f"{manager.config.BRIDGE.symbol} FEES VALUE:", bridge_fees_value)
+            # #print("BALANCES:", manager.balances)
+            # print("BTC VALUE:", btc_value, f"({btc_diff}%)")
+            # print(f"{manager.config.BRIDGE.symbol} VALUE:", bridge_value, f"({bridge_diff}%)")
+            # print("------")
     print("------")
     print("TIME:", manager.datetime)
     print("TRADES:", trades)

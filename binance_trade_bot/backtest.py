@@ -11,21 +11,29 @@ from .historic_kline_cache import HistoricKlineCache
 from .config import Config
 from .database import Database
 from .logger import Logger
-from .models import Coin, Pair, Trade, TradeState
+from .models import Pair, Trade, Coin, TradeState
 from .strategies import get_strategy
+
 
 class MockBinanceManager(BinanceAPIManager):
     def __init__(
-            self,
-            client: Client,
-            binance_cache: BinanceCache,
-            config: Config,
-            db: Database,
-            logger: Logger,
-            start_date: datetime = None,
-            start_balances: Dict[str, float] = None,
+        self,
+        client: Client,
+        binance_cache: BinanceCache,
+        config: Config,
+        db: Database,
+        logger: Logger,
+        start_date: datetime | None = None,
+        start_balances: Dict[str, float] | None = None,
     ):
-        super().__init__(client, binance_cache, config, db, logger, BinanceOrderBalanceManager(logger, config, client, binance_cache))
+        super().__init__(
+            client,
+            binance_cache,
+            config,
+            db,
+            logger,
+            BinanceOrderBalanceManager(logger, config, client, binance_cache),
+        )
         self.config = config
         self.datetime = start_date or datetime(2021, 1, 1)
         self.balances = start_balances or {config.BRIDGE.symbol: 100}
@@ -34,7 +42,7 @@ class MockBinanceManager(BinanceAPIManager):
         self.positve_coin_jumps = 0
         self.negative_coin_jumps = 0
         self.paid_fees = {}
-        self.coins_trades= {}
+        self.coins_trades = {}
         self.historic_kline_cache = HistoricKlineCache(client, logger)
 
     def now(self):
@@ -49,7 +57,7 @@ class MockBinanceManager(BinanceAPIManager):
     def get_fee(self, origin_coin: Coin, target_coin: Coin, selling: bool):
         if self.config.TRADE_FEE != "auto":
             return float(self.config.TRADE_FEE)
-            
+
         return 0.001
 
     def get_min_notional(self, origin_symbol: str, target_symbol: str):
@@ -68,7 +76,9 @@ class MockBinanceManager(BinanceAPIManager):
         """
         Get ticker price of a specific coin
         """
-        return self.historic_kline_cache.get_historical_ticker_price(ticker_symbol, self.now())
+        return self.historic_kline_cache.get_historical_ticker_price(
+            ticker_symbol, self.now()
+        )
 
     def get_currency_balance(self, currency_symbol: str, force=False):
         """
@@ -76,41 +86,82 @@ class MockBinanceManager(BinanceAPIManager):
         """
         return self.balances.get(currency_symbol, 0)
 
-    def buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float):
+    def buy_alt(
+        self,
+        origin_coin: Coin,
+        target_coin: Coin,
+        buy_price: float,
+        buy_quantity: float | None = None,
+    ):
         origin_symbol = origin_coin.symbol
         target_symbol = target_coin.symbol
 
         target_balance = self.get_currency_balance(target_symbol)
         from_coin_price = self.get_ticker_price(origin_symbol + target_symbol)
 
-        order_quantity = self._buy_quantity(origin_symbol, target_symbol, target_balance, from_coin_price)
+        if buy_quantity is None:
+            order_quantity = self._buy_quantity(
+                origin_symbol, target_symbol, target_balance, from_coin_price
+            )
+        else:
+            order_quantity = buy_quantity
+
+        if from_coin_price is None:
+            self.logger.error(
+                f"Failed to buy {origin_symbol} for {target_symbol}. Price is None."
+            )
+            return None
+
         target_quantity = order_quantity * from_coin_price
         fee = order_quantity * self.get_fee(origin_coin, target_coin, False)
         self.balances[target_symbol] -= target_quantity
-        self.balances[origin_symbol] = self.balances.get(origin_symbol, 0) + order_quantity - fee
+        self.balances[origin_symbol] = (
+            self.balances.get(origin_symbol, 0) + order_quantity - fee
+        )
+        paid_amount = self.balances[origin_symbol] * from_coin_price
         if origin_symbol not in self.paid_fees.keys():
             self.paid_fees[origin_symbol] = 0
         self.paid_fees[origin_symbol] += fee
-        if origin_symbol not in self.coins_trades.keys():
-            self.coins_trades[origin_symbol] = []
-        self.coins_trades[origin_symbol].append(self.balances[origin_symbol])
 
-        diff = self.get_diff(origin_symbol)
-        diff_str = ""
-        if diff is None:
+        if self.config.STRATEGY == "ema" or self.config.STRATEGY == "cdcv3":
+            if origin_symbol not in self.coins_trades.keys():
+                self.coins_trades[origin_symbol] = []
+            self.coins_trades[origin_symbol].append(paid_amount)
+            diff = None
             diff_str = "None"
+            # diff = self.get_diff2(target_symbol)
+            # diff_str = ""
+            # if diff is None:
+            #     diff_str = "None"
+            # else:
+            #     diff_str = f"{diff} %"
         else:
-            diff_str = f"{diff} %"
+            if origin_symbol not in self.coins_trades.keys():
+                self.coins_trades[origin_symbol] = []
+            self.coins_trades[origin_symbol].append(self.balances[origin_symbol])
 
-        self.logger.info(
-            f"{self.datetime} Bought {origin_symbol} {round(self.balances[origin_symbol], 4)} for {from_coin_price} {target_symbol}. Gain: {diff_str}"
-        )
-        
-        if diff is not None:
-            if diff > 0.0:
-                self.positve_coin_jumps +=1
+            diff = self.get_diff(origin_symbol)
+            diff_str = ""
+            if diff is None:
+                diff_str = "None"
+            else:
+                diff_str = f"{diff} %"
+
+            if diff is not None:
+                if diff > 0.0:
+                    self.positve_coin_jumps += 1
             else:
                 self.negative_coin_jumps += 1
+
+        # print("self.coins_trades", self.coins_trades)
+        if diff is None:
+            self.logger.info(
+                f"{self.datetime} >> Bought {round(self.balances[origin_symbol], 4)} {origin_symbol} for {round(paid_amount, 2)} {target_symbol}."
+            )
+        else:
+            self.logger.info(
+                f"{self.datetime} >> Bought {round(self.balances[origin_symbol], 4)} {origin_symbol} for {round(paid_amount, 2)} {target_symbol}. Gain: {diff_str}."
+            )
 
         event = defaultdict(
             lambda: None,
@@ -121,8 +172,14 @@ class MockBinanceManager(BinanceAPIManager):
 
         session: Session
         with self.db.db_session() as session:
-            from_coin = session.merge(origin_coin)
-            to_coin = session.merge(target_coin)
+            from_coin: Coin | None = session.merge(origin_coin)  # type: ignore
+            to_coin: Coin | None = session.merge(target_coin)  # type: ignore
+            if from_coin is None or to_coin is None:
+                self.logger.error(
+                    f"Failed to buy {origin_symbol} for {target_symbol}. Coin not found. from_coin: {from_coin}, to_coin: {to_coin}"
+                )
+                return None
+
             trade = Trade(from_coin, to_coin, False)
             trade.datetime = self.datetime
             trade.state = TradeState.COMPLETE
@@ -141,27 +198,64 @@ class MockBinanceManager(BinanceAPIManager):
         origin_balance = self.get_currency_balance(origin_symbol)
         from_coin_price = self.get_ticker_price(origin_symbol + target_symbol)
 
-        order_quantity = self._sell_quantity(origin_symbol, target_symbol, origin_balance)
+        order_quantity = self._sell_quantity(
+            origin_symbol, target_symbol, origin_balance
+        )
         target_quantity = order_quantity * from_coin_price
 
+        if from_coin_price is None:
+            self.logger.error(
+                f"Failed to sell {origin_symbol} for {target_symbol}. Price is None."
+            )
+            return None
+
         fee = target_quantity * self.get_fee(origin_coin, target_coin, True)
-        self.balances[target_symbol] = self.balances.get(target_symbol, 0) + target_quantity - fee
+        self.balances[target_symbol] = (
+            self.balances.get(target_symbol, 0) + target_quantity - fee
+        )
         if target_symbol not in self.paid_fees.keys():
             self.paid_fees[target_symbol] = 0
         self.paid_fees[target_symbol] += fee
         self.balances[origin_symbol] -= order_quantity
+        paid_amount = origin_balance * from_coin_price
 
+        if self.config.STRATEGY == "ema" or self.config.STRATEGY == "cdcv3":
+            if origin_symbol not in self.coins_trades.keys():
+                self.coins_trades[origin_symbol] = []
+            self.coins_trades[origin_symbol].append(paid_amount)
+
+            diff = self.get_diff(origin_symbol)
+            diff_str = ""
+            if diff is None:
+                diff_str = "None"
+            else:
+                diff_str = f"{diff} %"
+
+            if diff is not None:
+                if diff > 0.0:
+                    self.positve_coin_jumps += 1
+                else:
+                    self.negative_coin_jumps += 1
+        else:
+            diff = self.get_diff(origin_symbol)
+            diff_str = ""
+            if diff is None:
+                diff_str = "None"
+            else:
+                diff_str = f"{diff} %"
+
+        # print("self.coins_trades", self.coins_trades)
         self.logger.info(
-            f"{self.datetime} Sold {origin_symbol} for {from_coin_price} {target_symbol}"
+            f"{self.datetime} >> Sold {round(origin_balance, 4)} {origin_symbol} for {round(paid_amount, 2)} {target_symbol}. Gain/Loss: {diff_str}."
         )
-        
+
         self.trades += 1
         return {"price": from_coin_price}
 
-    def collate_coins(self, target_symbol: str):      
+    def collate_coins(self, target_symbol: str):
         return self.collate(target_symbol, self.balances)
 
-    def collate_fees(self, target_symbol: str):        
+    def collate_fees(self, target_symbol: str):
         return self.collate(target_symbol, self.paid_fees)
 
     def collate(self, target_symbol: str, balances: dict):
@@ -181,27 +275,43 @@ class MockBinanceManager(BinanceAPIManager):
                     continue
                 total += price * balance
         return total
-    
+
     def get_diff(self, symbol):
         if len(self.coins_trades[symbol]) == 1:
             return None
-        return round(((self.coins_trades[symbol][-1] - self.coins_trades[symbol][-2]) /self.coins_trades[symbol][-1] * 100 ),2)
+        # print("self.coins_trades", self.coins_trades[symbol])
+        return round(
+            (
+                (self.coins_trades[symbol][-1] - self.coins_trades[symbol][-2])
+                / self.coins_trades[symbol][-2]
+                * 100
+            ),
+            2,
+        )
+
 
 class MockDatabase(Database):
     def __init__(self, logger: Logger, config: Config):
         super().__init__(logger, config, "sqlite:///", True)
 
-    def log_scout(self, pair: Pair, target_ratio: float, current_coin_price: float, other_coin_price: float):
+    def log_scout(
+        self,
+        pair: Pair,
+        target_ratio: float,
+        current_coin_price: float,
+        other_coin_price: float,
+    ):
         pass
 
+
 def backtest(
-        start_date: datetime = None,
-        end_date: datetime = None,
-        interval=1,
-        yield_interval=100,
-        start_balances: Dict[str, float] = None,
-        starting_coin: str = None,
-        config: Config = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    interval: int | None = None,
+    yield_interval: int | None = None,
+    start_balances: Dict[str, float] | None = None,
+    starting_coin: str | None = None,
+    config: Config | None = None,
 ):
     """
 
@@ -223,20 +333,19 @@ def backtest(
     db = MockDatabase(logger, config)
     db.create_database()
     db.set_coins(config.SUPPORTED_COIN_LIST)
-    manager = MockBinanceManager(        
-        Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET_KEY, tld=config.BINANCE_TLD),
+    manager = MockBinanceManager(
+        Client(
+            config.BINANCE_API_KEY,
+            config.BINANCE_API_SECRET_KEY,
+            tld=config.BINANCE_TLD,
+        ),
         BinanceCache(),
-        config, 
-        db, 
+        config,
+        db,
         logger,
         start_date,
-        start_balances
+        start_balances,
     )
-
-    starting_coin = db.get_coin(starting_coin or config.CURRENT_COIN_SYMBOL or config.SUPPORTED_COIN_LIST[0])
-    if manager.get_currency_balance(starting_coin.symbol) == 0:
-        manager.buy_alt(starting_coin, config.BRIDGE, 0.0)  # doesn't matter mocking manager don't look at fixed price
-    db.set_current_coin(starting_coin)
 
     strategy = get_strategy(config.STRATEGY)
     if strategy is None:
@@ -246,6 +355,9 @@ def backtest(
     trader.initialize()
 
     yield manager
+
+    interval = interval or config.BACKTEST_INTERVAL
+    yield_interval = yield_interval or config.BACKTEST_YIELD_INTERVAL
 
     n = 1
     try:

@@ -13,7 +13,9 @@ class Logger:
         self.Logger = logging.getLogger(f"{logging_service}_logger")
         self.Logger.setLevel(logging.DEBUG)
         self.Logger.propagate = False
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
         # default is "logs/crypto_trading.log"
         fh = logging.FileHandler(f"logs/{logging_service}.log")
         fh.setLevel(logging.DEBUG)
@@ -29,7 +31,9 @@ class Logger:
         # notification handler
         self.NotificationHandler = NotificationHandler(enable_notifications)
 
-    def log(self, message, level="info", notification=True):
+    def log(self, message: str, level="info", notification=True):
+        if self.Logger is None:
+            return
 
         if level == "info":
             self.Logger.info(message)
@@ -40,7 +44,11 @@ class Logger:
         elif level == "debug":
             self.Logger.debug(message)
 
-        if notification and self.NotificationHandler.enabled:
+        if (
+            notification
+            and self.NotificationHandler
+            and self.NotificationHandler.enabled
+        ):
             self.NotificationHandler.send_notification(str(message))
 
     def info(self, message, notification=True):

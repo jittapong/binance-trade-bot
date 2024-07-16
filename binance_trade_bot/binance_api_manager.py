@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
@@ -12,19 +12,30 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from cachetools import TTLCache, cached
 from sqlalchemy.util.langhelpers import symbol
+from .historic_kline_cache import HistoricKlineCache
 
-from .binance_stream_manager import BinanceCache, BinanceOrder, BinanceStreamManager, OrderGuard
+from .binance_stream_manager import (
+    BinanceCache,
+    BinanceOrder,
+    BinanceStreamManager,
+    OrderGuard,
+)
 from .config import Config
 from .database import Database
 from .logger import Logger
 from .models import Coin
+from diskcache import Cache
+
+cache = Cache("data", size_limit=int(1e12))
+
 
 def float_as_decimal_str(num: float):
     return f"{num:0.08f}".rstrip("0").rstrip(".")  # remove trailing zeroes too
 
+
 class AbstractOrderBalanceManager(ABC):
     @abstractmethod
-    def get_currency_balance(self, currency_symbol: str, force=False):
+    def get_currency_balance(self, currency_symbol: str, force=False) -> float:
         pass
 
     @abstractmethod
@@ -32,12 +43,12 @@ class AbstractOrderBalanceManager(ABC):
         pass
 
     def make_order(
-        self, 
-        side: str, 
-        symbol: str, 
+        self,
+        side: str,
+        symbol: str,
         quantity: float,
         quote_quantity: float,
-        price: float
+        price: float,
     ):
         params = {
             "symbol": symbol,
@@ -50,8 +61,15 @@ class AbstractOrderBalanceManager(ABC):
             params["quoteOrderQty"] = float_as_decimal_str(quote_quantity)
         return self.create_order(**params)
 
+
 class BinanceOrderBalanceManager(AbstractOrderBalanceManager):
-    def __init__(self, logger: Logger, config: Config, binance_client: Client, cache: BinanceCache):
+    def __init__(
+        self,
+        logger: Logger,
+        config: Config,
+        binance_client: Client,
+        cache: BinanceCache,
+    ):
         self.logger = logger
         self.config = config
         self.binance_client = binance_client
@@ -69,7 +87,11 @@ class BinanceOrderBalanceManager(AbstractOrderBalanceManager):
             "symbol": symbol,
             "side": side,
             "quantity": float_as_decimal_str(quantity),
-            "type": self.config.BUY_ORDER_TYPE if side == Client.SIDE_BUY else self.config.SELL_ORDER_TYPE,
+            "type": (
+                self.config.BUY_ORDER_TYPE
+                if side == Client.SIDE_BUY
+                else self.config.SELL_ORDER_TYPE
+            ),
         }
         if params["type"] == Client.ORDER_TYPE_LIMIT:
             params["timeInForce"] = self.binance_client.TIME_IN_FORCE_GTC
@@ -93,7 +115,9 @@ class BinanceOrderBalanceManager(AbstractOrderBalanceManager):
                 cache_balances.update(
                     {
                         currency_balance["asset"]: float(currency_balance["free"])
-                        for currency_balance in self.binance_client.get_account()["balances"]
+                        for currency_balance in self.binance_client.get_account()[
+                            "balances"
+                        ]
                     }
                 )
                 self.logger.debug(f"Fetched all balances: {cache_balances}")
@@ -103,6 +127,7 @@ class BinanceOrderBalanceManager(AbstractOrderBalanceManager):
                 return cache_balances.get(currency_symbol, 0.0)
 
             return balance
+
 
 class BinanceAPIManager:
     def __init__(
@@ -122,6 +147,7 @@ class BinanceAPIManager:
         self.order_balance_manager = order_balance_manager
         self.stream_manager: Optional[BinanceStreamManager] = None
         self.setup_websockets()
+        self.historic_kline_cache = HistoricKlineCache(client, logger)
 
     @staticmethod
     def _common_factory(
@@ -137,24 +163,39 @@ class BinanceAPIManager:
             config.BINANCE_API_SECRET_KEY,
             tld=config.BINANCE_TLD,
         )
-        return BinanceAPIManager(client, cache, config, db, logger, ob_factory(client, cache))
+        return BinanceAPIManager(
+            client, cache, config, db, logger, ob_factory(client, cache)
+        )
 
     @staticmethod
-    def create_manager(config: Config, db: Database, logger: Logger) -> "BinanceAPIManager":
+    def create_manager(
+        config: Config, db: Database, logger: Logger
+    ) -> "BinanceAPIManager":
         return BinanceAPIManager._common_factory(
-            config, db, logger, lambda client, cache: BinanceOrderBalanceManager(logger, config, client, cache)
+            config,
+            db,
+            logger,
+            lambda client, cache: BinanceOrderBalanceManager(
+                logger, config, client, cache
+            ),
         )
 
     @staticmethod
     def create_manager_paper_trading(
-        config: Config, db: Database, logger: Logger, initial_balances: Optional[Dict[str, float]] = None
+        config: Config,
+        db: Database,
+        logger: Logger,
+        initial_balances: Optional[Dict[str, float]] = None,
     ) -> "BinanceAPIManager":
         manager = BinanceAPIManager._common_factory(
             config,
             db,
             logger,
             lambda client, cache: PaperOrderBalanceManager(
-                config.BRIDGE.symbol, client, cache, initial_balances or {config.BRIDGE.symbol: 100.0}
+                config.BRIDGE.symbol,
+                client,
+                cache,
+                initial_balances or {config.BRIDGE.symbol: 100.0},
             ),
         )
         manager.order_balance_manager.manager = manager
@@ -174,7 +215,10 @@ class BinanceAPIManager:
 
     @cached(cache=TTLCache(maxsize=1, ttl=43200))
     def get_trade_fees(self) -> Dict[str, float]:
-        return {ticker["symbol"]: float(ticker["takerCommission"]) for ticker in self.binance_client.get_trade_fee()}
+        return {
+            ticker["symbol"]: float(ticker["takerCommission"])
+            for ticker in self.binance_client.get_trade_fee()
+        }
 
     @cached(cache=TTLCache(maxsize=1, ttl=60))
     def get_using_bnb_for_fees(self):
@@ -222,7 +266,7 @@ class BinanceAPIManager:
             return self.get_ask_price(ticker_symbol)
         else:
             return self.get_ticker_price(ticker_symbol)
-            
+
     def get_sell_price(self, ticker_symbol: str):
         price_type = self.config.PRICE_TYPE
         if price_type == Config.PRICE_TYPE_ORDERBOOK:
@@ -237,12 +281,15 @@ class BinanceAPIManager:
         price = self.cache.ticker_values.get(ticker_symbol, None)
         if price is None and ticker_symbol not in self.cache.non_existent_tickers:
             self.cache.ticker_values = {
-                ticker["symbol"]: float(ticker["price"]) for ticker in self.binance_client.get_symbol_ticker()
+                ticker["symbol"]: float(ticker["price"])
+                for ticker in self.binance_client.get_symbol_ticker()
             }
             self.logger.debug(f"Fetched all ticker prices: {self.cache.ticker_values}")
             price = self.cache.ticker_values.get(ticker_symbol, None)
             if price is None:
-                self.logger.info(f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on")
+                self.logger.info(
+                    f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on"
+                )
                 self.cache.non_existent_tickers.add(ticker_symbol)
 
         return price
@@ -254,15 +301,17 @@ class BinanceAPIManager:
         price = self.cache.ticker_values_ask.get(ticker_symbol, None)
         if price is None and ticker_symbol not in self.cache.non_existent_tickers:
             try:
-                ticker = self.binance_client.get_orderbook_ticker(symbol = ticker_symbol)
-                price = float(ticker['askPrice'])
+                ticker = self.binance_client.get_orderbook_ticker(symbol=ticker_symbol)
+                price = float(ticker["askPrice"])
             except BinanceAPIException as e:
-                if e.code == -1121: # invalid symbol
+                if e.code == -1121:  # invalid symbol
                     price = None
                 else:
                     raise e
             if price is None:
-                self.logger.info(f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on")
+                self.logger.info(
+                    f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on"
+                )
                 self.cache.non_existent_tickers.add(ticker_symbol)
 
         return price
@@ -274,17 +323,19 @@ class BinanceAPIManager:
         price = self.cache.ticker_values_bid.get(ticker_symbol, None)
         if price is None and ticker_symbol not in self.cache.non_existent_tickers:
             try:
-                ticker = self.binance_client.get_orderbook_ticker(symbol = ticker_symbol)
-                price = float(ticker['bidPrice'])
+                ticker = self.binance_client.get_orderbook_ticker(symbol=ticker_symbol)
+                price = float(ticker["bidPrice"])
             except BinanceAPIException as e:
-                if e.code == -1121: # invalid symbol
+                if e.code == -1121:  # invalid symbol
                     price = None
                 else:
                     raise e
             if price is None:
-                self.logger.info(f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on")
+                self.logger.info(
+                    f"Ticker does not exist: {ticker_symbol} - will not be fetched from now on"
+                )
                 self.cache.non_existent_tickers.add(ticker_symbol)
-        
+
         return price
 
     def get_currency_balance(self, currency_symbol: str, force=False) -> float:
@@ -298,33 +349,47 @@ class BinanceAPIManager:
             try:
                 return func(*args, **kwargs)
             except Exception:  # pylint: disable=broad-except
-                self.logger.warning(f"Failed to Buy/Sell. Trying Again (attempt {attempt}/20)")
+                self.logger.warning(
+                    f"Failed to Buy/Sell. Trying Again (attempt {attempt}/20)"
+                )
                 if attempt == 0:
                     self.logger.warning(traceback.format_exc())
             time.sleep(1)
         return None
 
-    def get_symbol_filter(self, origin_symbol: str, target_symbol: str, filter_type: str):
+    def get_symbol_filter(
+        self, origin_symbol: str, target_symbol: str, filter_type: str
+    ):
         return next(
             _filter
-            for _filter in self.binance_client.get_symbol_info(origin_symbol + target_symbol)["filters"]
+            for _filter in self.binance_client.get_symbol_info(
+                origin_symbol + target_symbol
+            )["filters"]
             if _filter["filterType"] == filter_type
         )
 
     @cached(cache=TTLCache(maxsize=2000, ttl=43200))
     def get_alt_tick(self, origin_symbol: str, target_symbol: str):
-        step_size = self.get_symbol_filter(origin_symbol, target_symbol, "LOT_SIZE")["stepSize"]
+        step_size = self.get_symbol_filter(origin_symbol, target_symbol, "LOT_SIZE")[
+            "stepSize"
+        ]
         if step_size.find("1") == 0:
             return 1 - step_size.find(".")
         return step_size.find("1") - 1
 
     @cached(cache=TTLCache(maxsize=2000, ttl=43200))
     def get_min_notional(self, origin_symbol: str, target_symbol: str):
-        return float(self.get_symbol_filter(origin_symbol, target_symbol, "MIN_NOTIONAL")["minNotional"])
+        return float(
+            self.get_symbol_filter(origin_symbol, target_symbol, "MIN_NOTIONAL")[
+                "minNotional"
+            ]
+        )
 
     @cached(cache=TTLCache(maxsize=2000, ttl=43200))
     def get_min_qty(self, origin_symbol: str, target_symbol: str):
-        return float(self.get_symbol_filter(origin_symbol, target_symbol, "LOT_SIZE")["minQty"])
+        return float(
+            self.get_symbol_filter(origin_symbol, target_symbol, "LOT_SIZE")["minQty"]
+        )
 
     def _wait_for_order(
         self, order_id, origin_symbol: str, target_symbol: str
@@ -353,21 +418,29 @@ class BinanceAPIManager:
                     self.logger.info("Order timeout, canceled...")
 
                     # sell partially
-                    if order_status.status == "PARTIALLY_FILLED" and order_status.side == "BUY":
+                    if (
+                        order_status.status == "PARTIALLY_FILLED"
+                        and order_status.side == "BUY"
+                    ):
                         self.logger.info("Sell partially filled amount")
 
-                        order_quantity = self._sell_quantity(origin_symbol, target_symbol)
+                        order_quantity = self._sell_quantity(
+                            origin_symbol, target_symbol
+                        )
                         partially_order = None
                         while partially_order is None:
                             partially_order = self.binance_client.order_market_sell(
-                                symbol=origin_symbol + target_symbol, quantity=order_quantity
+                                symbol=origin_symbol + target_symbol,
+                                quantity=order_quantity,
                             )
 
                     self.logger.info("Going back to scouting mode...")
                     return None
 
                 if order_status.status == "CANCELED":
-                    self.logger.info("Order is canceled, going back to scouting mode...")
+                    self.logger.info(
+                        "Order is canceled, going back to scouting mode..."
+                    )
                     return None
 
                 time.sleep(1)
@@ -405,7 +478,9 @@ class BinanceAPIManager:
 
             if order_status.side == "BUY":
                 current_price = self.get_buy_price(order_status.symbol)
-                if float(current_price) * (1 - 0.001) > float(order_status.price):
+                if not (current_price is None) and float(current_price) * (
+                    1 - 0.001
+                ) > float(order_status.price):
                     return True
 
         return False
@@ -439,42 +514,81 @@ class BinanceAPIManager:
         alt_tick = self.get_alt_tick("BNB", target_coin.symbol)
         # Default value of AUTO_ADJUST_BNB_BALANCE_RATE is 3, means trying to buy 3x BNB compare to the commision needed by the coming order.
         # Put "3x" as default since: 1. buy commision, 2. sell commision, 3. buffer, since selling price may rise and then needs more comission.
-        fee_amount_bnb_ceil = math.ceil((fee_amount_bnb * self.config.AUTO_ADJUST_BNB_BALANCE_RATE - bnb_balance) * 10 ** alt_tick) / float(10 ** alt_tick)
+        fee_amount_bnb_ceil = math.ceil(
+            (fee_amount_bnb * self.config.AUTO_ADJUST_BNB_BALANCE_RATE - bnb_balance)
+            * 10**alt_tick
+        ) / float(10**alt_tick)
 
         min_notional = self.get_min_notional("BNB", target_coin.symbol)
         bnb_price = self.get_ticker_price("BNB" + target_coin.symbol)
+        if bnb_price is None:
+            self.logger.error(
+                f"Failed to adjust BNB balance. BNB price is None for {target_coin.symbol}"
+            )
+            return
         # multiply 1.01 considering that market price is changing
-        min_qty_for_min_notinal = math.ceil((min_notional / bnb_price) * 1.01 * 10 ** alt_tick) / float(10 ** alt_tick)
+        min_qty_for_min_notinal = math.ceil(
+            (min_notional / bnb_price) * 1.01 * 10**alt_tick
+        ) / float(10**alt_tick)
 
         buy_quantity = max(min_qty, fee_amount_bnb_ceil, min_qty_for_min_notinal)
 
-        self.logger.info(f"Needed/available BNB balance: {fee_amount_bnb}/{bnb_balance}, buy quantity: {buy_quantity}...")
+        self.logger.info(
+            f"Needed/available BNB balance: {fee_amount_bnb}/{bnb_balance}, buy quantity: {buy_quantity}..."
+        )
 
         is_bnb_enabled = "BNB" in self.config.SUPPORTED_COIN_LIST
 
-        self.retry(self._buy_alt, Coin("BNB", enabled=is_bnb_enabled), target_coin, bnb_price, buy_quantity)
+        self.retry(
+            self._buy_alt,
+            Coin("BNB", enabled=is_bnb_enabled),
+            target_coin,
+            bnb_price,
+            buy_quantity,
+        )
 
-    def buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float) -> BinanceOrder:
-        return self.retry(self._buy_alt, origin_coin, target_coin, buy_price)
+    def buy_alt(
+        self, origin_coin: Coin, target_coin: Coin, buy_price: float, buy_quantity: float | None = None
+    ) -> BinanceOrder:
+        return self.retry(self._buy_alt, origin_coin, target_coin, buy_price, buy_quantity)
 
     def _buy_quantity(
-        self, origin_symbol: str, target_symbol: str, target_balance: float = None, from_coin_price: float = None
-    ):
+        self,
+        origin_symbol: str,
+        target_symbol: str,
+        target_balance: float | None = None,
+        from_coin_price: float | None = None,
+    ) -> float:
         target_balance = target_balance or self.get_currency_balance(target_symbol)
-        from_coin_price = from_coin_price or self.get_buy_price(origin_symbol + target_symbol)
+        from_coin_price = from_coin_price or self.get_buy_price(
+            origin_symbol + target_symbol
+        )
 
         origin_tick = self.get_alt_tick(origin_symbol, target_symbol)
-        return math.floor(target_balance * 10 ** origin_tick / from_coin_price) / float(10 ** origin_tick)
+
+        return math.floor(target_balance * 10**origin_tick / from_coin_price) / float(
+            10**origin_tick
+        )
 
     @staticmethod
     def float_as_decimal_str(num: float):
-        return f"{num:0.08f}".rstrip("0").rstrip(".")  # remove trailing zeroes too    
+        return f"{num:0.08f}".rstrip("0").rstrip(".")  # remove trailing zeroes too
 
-    def _buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float, buy_quantity: float=None):  # pylint: disable=too-many-locals
+    def _buy_alt(
+        self,
+        origin_coin: Coin,
+        target_coin: Coin,
+        buy_price: float,
+        buy_quantity: float | None = None,
+    ):  # pylint: disable=too-many-locals
         """
         Buy altcoin
         """
-        if self.config.AUTO_ADJUST_BNB_BALANCE and origin_coin.symbol != "BNB" and not self.config.ENABLE_PAPER_TRADING:
+        if (
+            self.config.AUTO_ADJUST_BNB_BALANCE
+            and origin_coin.symbol != "BNB"
+            and not self.config.ENABLE_PAPER_TRADING
+        ):
             self._adjust_bnb_balance(origin_coin, target_coin)
 
         origin_symbol = origin_coin.symbol
@@ -487,15 +601,23 @@ class BinanceAPIManager:
         target_balance = self.get_currency_balance(target_symbol)
         from_coin_price = self.get_buy_price(origin_symbol + target_symbol)
 
+        if from_coin_price is None:
+            self.logger.error(
+                f"Failed to buy {origin_symbol} for {target_symbol}. Price is None."
+            )
+            return None
+
         buy_max_price_change = float(self.config.BUY_MAX_PRICE_CHANGE)
         if from_coin_price > buy_price * (1.0 + buy_max_price_change):
             self.logger.info("Buy price became higher, cancel buy")
             return None
-        #from_coin_price = min(buy_price, from_coin_price)
+        # from_coin_price = min(buy_price, from_coin_price)
         trade_log = self.db.start_trade_log(origin_coin, target_coin, False)
 
         if buy_quantity is None:
-            order_quantity = self._buy_quantity(origin_symbol, target_symbol, target_balance, from_coin_price)
+            order_quantity = self._buy_quantity(
+                origin_symbol, target_symbol, target_balance, from_coin_price
+            )
         else:
             order_quantity = buy_quantity
         self.logger.info(f"BUY QTY {order_quantity} of <{origin_symbol}>")
@@ -521,12 +643,16 @@ class BinanceAPIManager:
 
         executed_qty = float(order.get("executedQty", 0))
         if executed_qty > 0 and order["status"] == "FILLED":
-            order_quantity = executed_qty  # Market buys provide QTY of actually bought asset
+            order_quantity = (
+                executed_qty  # Market buys provide QTY of actually bought asset
+            )
 
         trade_log.set_ordered(origin_balance, target_balance, order_quantity)
 
         order_guard.set_order(origin_symbol, target_symbol, int(order["orderId"]))
-        order = self.wait_for_order(order["orderId"], origin_symbol, target_symbol, order_guard)
+        order = self.wait_for_order(
+            order["orderId"], origin_symbol, target_symbol, order_guard
+        )
 
         if order is None:
             return None
@@ -537,16 +663,22 @@ class BinanceAPIManager:
 
         return order
 
-    def sell_alt(self, origin_coin: Coin, target_coin: Coin, sell_price: float) -> BinanceOrder:
+    def sell_alt(
+        self, origin_coin: Coin, target_coin: Coin, sell_price: float
+    ) -> BinanceOrder:
         return self.retry(self._sell_alt, origin_coin, target_coin, sell_price)
 
-    def _sell_quantity(self, origin_symbol: str, target_symbol: str, origin_balance: float = None):
+    def _sell_quantity(
+        self, origin_symbol: str, target_symbol: str, origin_balance: float = None
+    ):
         origin_balance = origin_balance or self.get_currency_balance(origin_symbol)
 
         origin_tick = self.get_alt_tick(origin_symbol, target_symbol)
-        return math.floor(origin_balance * 10 ** origin_tick) / float(10 ** origin_tick)
+        return math.floor(origin_balance * 10**origin_tick) / float(10**origin_tick)
 
-    def _sell_alt(self, origin_coin: Coin, target_coin: Coin, sell_price: float):  # pylint: disable=too-many-locals
+    def _sell_alt(
+        self, origin_coin: Coin, target_coin: Coin, sell_price: float
+    ):  # pylint: disable=too-many-locals
         """
         Sell altcoin
         """
@@ -561,15 +693,23 @@ class BinanceAPIManager:
         target_balance = self.get_currency_balance(target_symbol)
         from_coin_price = self.get_sell_price(origin_symbol + target_symbol)
 
+        if from_coin_price is None:
+            self.logger.error(
+                f"Failed to sell {origin_symbol} for {target_symbol}. Price is None."
+            )
+            return None
+
         sell_max_price_change = float(self.config.SELL_MAX_PRICE_CHANGE)
         if from_coin_price < sell_price * (1.0 - sell_max_price_change):
             self.logger.info("Sell price became lower, skipping sell")
             return None  # skip selling below price from ratio
-        #from_coin_price = max(from_coin_price, sell_price)
+        # from_coin_price = max(from_coin_price, sell_price)
 
         trade_log = self.db.start_trade_log(origin_coin, target_coin, True)
 
-        order_quantity = self._sell_quantity(origin_symbol, target_symbol, origin_balance)
+        order_quantity = self._sell_quantity(
+            origin_symbol, target_symbol, origin_balance
+        )
         self.logger.info(f"Selling {order_quantity} of {origin_symbol}")
 
         self.logger.info(f"Balance is {origin_balance}")
@@ -597,7 +737,9 @@ class BinanceAPIManager:
         trade_log.set_ordered(origin_balance, target_balance, order_quantity)
 
         order_guard.set_order(origin_symbol, target_symbol, int(order["orderId"]))
-        order = self.wait_for_order(order["orderId"], origin_symbol, target_symbol, order_guard)
+        order = self.wait_for_order(
+            order["orderId"], origin_symbol, target_symbol, order_guard
+        )
 
         if order is None:
             return None
@@ -612,6 +754,44 @@ class BinanceAPIManager:
 
         return order
 
+    def get_ticker_price_in_range(
+        self, ticker_symbol: str, start_date: datetime, end_date: datetime, delta=1, time_frame="1d"
+    ):
+        data = []
+        current_date = start_date
+        while current_date <= end_date:
+            price = self.historic_kline_cache.get_historical_ticker_price(
+                ticker_symbol, current_date, cache, True, time_frame
+            )
+            # self.logger.info(f"get_ticker_price_in_range >> current_date: {current_date} price: {price}")
+            if price is not None:
+                data.append(price)
+
+            current_date = current_date + timedelta(minutes=delta)
+
+        return data
+
+    def get_balances(self, target_coins):
+        # self.logger.info(f"target_coins : {target_coins}")
+        balances = {}
+        for coin in target_coins:
+            balances[coin.symbol] = self.get_currency_balance(coin.symbol)
+        return balances
+
+    def get_usd_balances(self, balances: Dict[str, float]):
+        result = {}
+        for token_symbol, balance in balances.items():
+            if token_symbol == self.config.BRIDGE_SYMBOL:
+                result[token_symbol] = balance
+            else:
+                sell_price = self.get_sell_price(
+                    token_symbol + self.config.BRIDGE_SYMBOL
+                )
+                if not sell_price is None:
+                    result[token_symbol] = balance * sell_price
+        return result
+
+
 class PaperOrderBalanceManager(AbstractOrderBalanceManager):
     PERSIST_FILE_PATH = "data/paper_wallet.json"
 
@@ -623,7 +803,7 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
         initial_balances: Dict[str, float],
         read_persist=True,
     ):
-        self.manager: BinanceAPIManager = None
+        self.manager: BinanceAPIManager | None = None
         self.balances = initial_balances
         self.bridge = bridge_symbol
         self.client = client
@@ -646,7 +826,10 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
 
     def _write_persist(self):
         with open(self.PERSIST_FILE_PATH, "w") as json_file:
-            json.dump({"balances": self.balances, "fake_order_id": self.fake_order_id}, json_file)
+            json.dump(
+                {"balances": self.balances, "fake_order_id": self.fake_order_id},
+                json_file,
+            )
 
     def get_currency_balance(self, currency_symbol: str, force=False):
         return self.balances.get(currency_symbol, 0.0)
@@ -655,22 +838,30 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
         return {}
 
     def make_order(
-        self, 
-        side: str, 
-        symbol: str, 
+        self,
+        side: str,
+        symbol: str,
         quantity: float,
         quote_quantity: float,
-        price: float
+        price: float,
     ):
         symbol_base = symbol[: -len(self.bridge)]
         if side == Client.SIDE_SELL:
             fees = self.manager.get_fee(Coin(symbol_base), Coin(self.bridge), True)
-            self.balances[self.bridge] = self.get_currency_balance(self.bridge) + quote_quantity * (1 - fees)
-            self.balances[symbol_base] = self.get_currency_balance(symbol_base) - quantity
+            self.balances[self.bridge] = self.get_currency_balance(
+                self.bridge
+            ) + quote_quantity * (1 - fees)
+            self.balances[symbol_base] = (
+                self.get_currency_balance(symbol_base) - quantity
+            )
         else:
             fees = self.manager.get_fee(Coin(symbol_base), Coin(self.bridge), False)
-            self.balances[self.bridge] = self.get_currency_balance(self.bridge) - quote_quantity
-            self.balances[symbol_base] = self.get_currency_balance(symbol_base) + quantity * (1 - fees)
+            self.balances[self.bridge] = (
+                self.get_currency_balance(self.bridge) - quote_quantity
+            )
+            self.balances[symbol_base] = self.get_currency_balance(
+                symbol_base
+            ) + quantity * (1 - fees)
         self.cache.balances_changed_event.set()
         super().make_order(side, symbol, quantity, quote_quantity, price)
         if side == Client.SIDE_BUY:
@@ -678,7 +869,7 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
             # probably should be a better idea to make it a postponed call
             self._write_persist()
 
-        self.fake_order_id += 1       
+        self.fake_order_id += 1
 
         forder = BinanceOrder(
             defaultdict(

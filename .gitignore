@@ -9,6 +9,7 @@ user.cfg
 .vscode/
 .replit
 venv/
+wvenv/
 crypto_trading.db
 apprise.yml
 .DS_Store
